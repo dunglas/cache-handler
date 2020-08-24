@@ -24,14 +24,14 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/buraksezer/olric"
+	"github.com/buraksezer/olric/config"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"github.com/golang/groupcache"
-	"github.com/pomerium/autocache"
 )
 
 func init() {
-	caddy.RegisterModule(Cache{})
+	_ = caddy.RegisterModule(Cache{})
 }
 
 // Cache implements a simple distributed cache.
@@ -49,7 +49,8 @@ type Cache struct {
 	// Maximum size of the cache, in bytes. Default is 512 MB.
 	MaxSize int64 `json:"max_size,omitempty"`
 
-	group *groupcache.Group
+	db   *olric.Olric
+	dmap *olric.DMap
 }
 
 // CaddyModule returns the Caddy module information.
@@ -62,32 +63,40 @@ func (Cache) CaddyModule() caddy.ModuleInfo {
 
 // Provision provisions c.
 func (c *Cache) Provision(ctx caddy.Context) error {
-	// TODO: use UsagePool so that cache survives config reloads - TODO: a single cache for whole process?
 	maxSize := c.MaxSize
 	if maxSize == 0 {
 		const maxMB = 512
 		maxSize = int64(maxMB << 20)
 	}
 
-	ac, err := autocache.New(&autocache.Options{})
-	if err != nil {
-		return err
+	// TODO: Set environment
+	started, cancel := context.WithCancel(context.Background())
+	cfg := config.New("local")
+	cfg.Cache.MaxInuse = int(maxSize)
+	cfg.Started = func() {
+		defer cancel()
+		log.Printf("[INFO] Olric is ready to accept connections")
 	}
-	_, err = ac.Join(nil)
+	db, err := olric.New(cfg)
 	if err != nil {
 		return err
 	}
 
-	poolMu.Lock()
-	if pool == nil {
-		pool = ac.GroupcachePool
-		c.group = groupcache.NewGroup(groupName, maxSize, groupcache.GetterFunc(c.getter))
-	} else {
-		c.group = groupcache.GetGroup(groupName)
+	errCh := make(chan error, 1)
+	go func() {
+		err = db.Start()
+		if err != nil {
+			log.Printf("[ERROR] olric.Start returned an error: %v", err)
+			errCh <- err
+		}
+	}()
+	select {
+	case err = <-errCh:
+		return err
+	case <-started.Done():
 	}
-	poolMu.Unlock()
-
-	return nil
+	c.dmap, err = db.NewDMap(dmapName)
+	return err
 }
 
 // Validate validates c.
@@ -116,10 +125,16 @@ func (c *Cache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp
 	// now we just use the request URI as a proof-of-concept
 	key := r.RequestURI
 
-	var cachedBytes []byte
-	err := c.group.Get(ctx, key, groupcache.AllocatingByteSliceSink(&cachedBytes))
-	if err == errUncacheable {
-		return nil
+	value, err := c.dmap.Get(key)
+	if err == olric.ErrKeyNotFound {
+		// Cache the request here
+		err = c.tryToCache(ctx, key)
+		if err == errUncacheable {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
 	}
 	if err != nil {
 		return err
@@ -128,7 +143,7 @@ func (c *Cache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp
 	// the cached bytes consists of two parts: first a
 	// gob encoding of the status and header, immediately
 	// followed by the raw bytes of the response body
-	rdr := bytes.NewReader(cachedBytes)
+	rdr := bytes.NewReader(value.([]byte))
 
 	// read the header and status first
 	var hs headerAndStatus
@@ -149,7 +164,7 @@ func (c *Cache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp
 	return nil
 }
 
-func (c *Cache) getter(ctx context.Context, key string, dest groupcache.Sink) error {
+func (c *Cache) tryToCache(ctx context.Context, key string) error {
 	combo := ctx.Value(getterContextCtxKey).(getterContext)
 
 	// the buffer will store the gob-encoded header, then the body
@@ -196,9 +211,7 @@ func (c *Cache) getter(ctx context.Context, key string, dest groupcache.Sink) er
 	}
 
 	// add to cache
-	dest.SetBytes(buf.Bytes())
-
-	return nil
+	return c.dmap.Put(key, buf.Bytes())
 }
 
 type headerAndStatus struct {
@@ -218,14 +231,9 @@ var bufPool = sync.Pool{
 	},
 }
 
-var (
-	pool   *groupcache.HTTPPool
-	poolMu sync.Mutex
-)
-
 var errUncacheable = fmt.Errorf("uncacheable")
 
-const groupName = "http_requests"
+const dmapName = "http_requests"
 
 type ctxKey string
 
