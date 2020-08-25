@@ -1,4 +1,4 @@
-module github.com/caddyserver/cache-handler
+module github.com/buraksezer/cache-handler
 
 go 1.14
 

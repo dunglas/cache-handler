@@ -31,7 +31,7 @@ import (
 )
 
 func init() {
-	_ = caddy.RegisterModule(Cache{})
+	caddy.RegisterModule(Cache{})
 }
 
 // Cache implements a simple distributed cache.
@@ -107,47 +107,10 @@ func (c *Cache) Validate() error {
 	return nil
 }
 
-func (c *Cache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	// TODO: proper RFC implementation of cache control headers...
-	if r.Header.Get("Cache-Control") == "no-cache" || (r.Method != "GET" && r.Method != "HEAD") {
-		return next.ServeHTTP(w, r)
-	}
-
-	getterCtx := getterContext{w, r, next}
-	ctx := context.WithValue(r.Context(), getterContextCtxKey, getterCtx)
-
-	// TODO: rigorous performance testing
-
-	// TODO: pretty much everything else to handle the nuances of HTTP caching...
-
-	// TODO: groupcache has no explicit cache eviction, so we need to embed
-	// all information related to expiring cache entries into the key; right
-	// now we just use the request URI as a proof-of-concept
-	key := r.RequestURI
-
-	value, err := c.dmap.Get(key)
-	if err == olric.ErrKeyNotFound {
-		// Cache the request here
-		err = c.tryToCache(ctx, key)
-		if err == errUncacheable {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-	}
-	if err != nil {
-		return err
-	}
-
-	// the cached bytes consists of two parts: first a
-	// gob encoding of the status and header, immediately
-	// followed by the raw bytes of the response body
-	rdr := bytes.NewReader(value.([]byte))
-
+func (c *Cache) writeResponse(w http.ResponseWriter, rdr io.Reader) error {
 	// read the header and status first
 	var hs headerAndStatus
-	err = gob.NewDecoder(rdr).Decode(&hs)
+	err := gob.NewDecoder(rdr).Decode(&hs)
 	if err != nil {
 		return err
 	}
@@ -159,18 +122,41 @@ func (c *Cache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp
 	w.WriteHeader(hs.Status)
 
 	// write the cached response body
-	io.Copy(w, rdr)
-
-	return nil
+	_, err = io.Copy(w, rdr)
+	return err
 }
 
-func (c *Cache) tryToCache(ctx context.Context, key string) error {
-	combo := ctx.Value(getterContextCtxKey).(getterContext)
+func (c *Cache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	// TODO: proper RFC implementation of cache control headers...
+	if r.Header.Get("Cache-Control") == "no-cache" || (r.Method != "GET" && r.Method != "HEAD") {
+		return next.ServeHTTP(w, r)
+	}
+
+	getterCtx := getterContext{w, r, next}
+	ctx := context.WithValue(r.Context(), getterContextCtxKey, getterCtx)
+	key := r.RequestURI
 
 	// the buffer will store the gob-encoded header, then the body
 	buf := bufPool.Get().(*bytes.Buffer)
 	buf.Reset()
 	defer bufPool.Put(buf)
+
+	value, err := c.dmap.Get(key)
+	if err != nil {
+		if err == olric.ErrKeyNotFound {
+			// Cache the request here
+			return c.serveAndCache(ctx, key, buf)
+		}
+		return err
+	}
+
+	// We found the key in the Olric cluster.
+	buf.Write(value.([]byte))
+	return c.writeResponse(w, buf)
+}
+
+func (c *Cache) serveAndCache(ctx context.Context, key string, buf *bytes.Buffer) error {
+	combo := ctx.Value(getterContextCtxKey).(getterContext)
 
 	// we need to record the response if we are to cache it; only cache if
 	// request is successful (TODO: there's probably much more nuance needed here)
@@ -207,11 +193,18 @@ func (c *Cache) tryToCache(ctx context.Context, key string) error {
 	// if there was no response to buffer, same thing.
 	// TODO: maybe Buffered() should return false if there was no response to buffer (which would account for the case when shouldBuffer is never called)
 	if !rr.Buffered() || buf.Len() == 0 {
-		return errUncacheable
+		// TODO: I'm not sure meaning of this
+		// return errUncacheable
+		return nil
 	}
 
 	// add to cache
-	return c.dmap.Put(key, buf.Bytes())
+	err = c.dmap.Put(key, buf.Bytes())
+	if err != nil {
+		return err
+	}
+	// Serve the response from bytes.Buffer
+	return c.writeResponse(combo.rw, buf)
 }
 
 type headerAndStatus struct {
