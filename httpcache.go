@@ -22,13 +22,17 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/buraksezer/olric"
 	"github.com/buraksezer/olric/config"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/pquerna/cachecontrol/cacheobject"
 	"go.uber.org/zap"
 )
+
+const userAgent = "Caddy"
 
 func init() {
 	caddy.RegisterModule(Cache{})
@@ -47,7 +51,8 @@ func init() {
 // - More control over what gets cached
 type Cache struct {
 	// Maximum size of the cache, in bytes. Default is 512 MB.
-	MaxSize int64 `json:"max_size,omitempty"`
+	MaxSize    int64 `json:"max_size,omitempty"`
+	DefaultTTL int64 `json:"default_ttl,omitempty"`
 
 	db     *olric.Olric
 	dmap   *olric.DMap
@@ -132,12 +137,25 @@ func (c *Cache) writeResponse(w http.ResponseWriter, rdr io.Reader) error {
 }
 
 func (c *Cache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	// TODO: proper RFC implementation of cache control headers...
-	if r.Header.Get("Cache-Control") == "no-cache" || (r.Method != "GET" && r.Method != "HEAD") {
+	// TODO(dunglas): use functions added in https://github.com/pquerna/cachecontrol/pull/18 if merged
+	switch r.Method {
+	case "GET":
+	case "HEAD":
+	case "POST":
+	default:
+		// method not cacheable
+		w.Header().Add("Cache-Status", userAgent+"; fwd=request; detail=METHOD")
 		return next.ServeHTTP(w, r)
 	}
 
-	getterCtx := getterContext{w, r, next}
+	reqDir, err := cacheobject.ParseRequestCacheControl(r.Header.Get("Cache-Control"))
+	if err != nil || reqDir.NoCache || reqDir.NoStore {
+		// TODO: implement no-cache properly (add support for validation)
+		w.Header().Add("Cache-Status", userAgent+"; fwd=request; detail=DIRECTIVE")
+		return next.ServeHTTP(w, r)
+	}
+
+	getterCtx := getterContext{w, r, next, reqDir}
 	ctx := context.WithValue(r.Context(), getterContextCtxKey, getterCtx)
 	key := r.RequestURI
 
@@ -157,34 +175,79 @@ func (c *Cache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp
 
 	// We found the key in the Olric cluster.
 	buf.Write(value.([]byte))
+	w.Header().Add("Cache-Status", userAgent+"; hit")
+
 	return c.writeResponse(w, buf)
 }
 
 func (c *Cache) serveAndCache(ctx context.Context, key string, buf *bytes.Buffer) error {
 	combo := ctx.Value(getterContextCtxKey).(getterContext)
+	respHeaders := combo.rw.Header()
+	obj := cacheobject.Object{
+		ReqDirectives: combo.reqDir,
+		ReqHeaders:    combo.req.Header,
+		ReqMethod:     combo.req.Method,
+
+		NowUTC: time.Now().UTC(),
+	}
+	rv := cacheobject.ObjectResults{}
 
 	// we need to record the response if we are to cache it; only cache if
 	// request is successful (TODO: there's probably much more nuance needed here)
 	rr := caddyhttp.NewResponseRecorder(combo.rw, buf, func(status int, header http.Header) bool {
-		shouldBuf := status < 300
+		var err error
+		resDir, err := cacheobject.ParseResponseCacheControl(respHeaders.Get("Cache-Control"))
+		if err != nil {
+			respHeaders.Add("Cache-Status", userAgent+"; fwd=request; detail=MALFORMED-CACHE-CONTROL")
+			return false
+		}
 
-		if shouldBuf {
-			// store the header before the body, so we can efficiently
-			// and conveniently use a single buffer for both; gob
-			// decoder will only read up to end of gob message, and
-			// the rest will be the body, which will be written
-			// implicitly for us by the recorder
-			err := gob.NewEncoder(buf).Encode(headerAndStatus{
-				Header: header,
-				Status: status,
-			})
-			if err != nil {
-				c.logger.Error("encoding headers for cache entry, not caching this request", zap.Error(err))
+		if expires := respHeaders.Get("Expires"); expires != "" {
+			if obj.RespExpiresHeader, err = http.ParseTime(expires); err != nil {
+				respHeaders.Add("Cache-Status", userAgent+"; fwd=request; detail=MALFORMED-EXPIRES")
 				return false
 			}
 		}
 
-		return shouldBuf
+		if date := respHeaders.Get("Date"); date != "" {
+			if obj.RespDateHeader, err = http.ParseTime(date); err != nil {
+				respHeaders.Add("Cache-Status", userAgent+"; fwd=request; detail=MALFORMED-DATE")
+				return false
+			}
+		}
+
+		if lastModified := respHeaders.Get("Last-Modified"); lastModified != "" {
+			if obj.RespLastModifiedHeader, err = http.ParseTime(lastModified); err != nil {
+				respHeaders.Add("Cache-Status", userAgent+"; fwd=request; detail=MALFORMED-LAST-MODIFIED")
+				return false
+			}
+		}
+
+		obj.RespDirectives = resDir
+		obj.RespHeaders = respHeaders
+		obj.RespStatusCode = status
+
+		cacheobject.CachableObject(&obj, &rv)
+		if rv.OutErr != nil || len(rv.OutReasons) > 0 {
+			respHeaders.Add("Cache-Status", fmt.Sprintf(userAgent+`; fwd=request; detail="%v"`, rv.OutReasons))
+			return false
+		}
+
+		// store the header before the body, so we can efficiently
+		// and conveniently use a single buffer for both; gob
+		// decoder will only read up to end of gob message, and
+		// the rest will be the body, which will be written
+		// implicitly for us by the recorder
+		err = gob.NewEncoder(buf).Encode(headerAndStatus{
+			Header: header,
+			Status: status,
+		})
+		if err != nil {
+			c.logger.Error("encoding headers for cache entry, not caching this request", zap.Error(err))
+			return false
+		}
+
+		return true
 	})
 
 	// execute next handlers in chain
@@ -203,11 +266,28 @@ func (c *Cache) serveAndCache(ctx context.Context, key string, buf *bytes.Buffer
 		return nil
 	}
 
+	cacheobject.ExpirationObject(&obj, &rv)
+
+	var zeroTime time.Time
+	var ttl time.Duration
+	if rv.OutExpirationTime == zeroTime {
+		ttl = time.Duration(c.DefaultTTL) * time.Second
+	} else {
+		ttl = rv.OutExpirationTime.Sub(obj.NowUTC)
+	}
+
+	if ttl <= 0 {
+		respHeaders.Add("Cache-Status", userAgent+"; fwd=uri-miss")
+		return c.writeResponse(combo.rw, buf)
+	}
+
 	// add to cache
-	err = c.dmap.Put(key, buf.Bytes())
-	if err != nil {
+	if err := c.dmap.PutEx(key, buf.Bytes(), ttl); err != nil {
 		return err
 	}
+
+	respHeaders.Add("Cache-Status", userAgent+"; fwd=uri-miss; stored")
+
 	// Serve the response from bytes.Buffer
 	return c.writeResponse(combo.rw, buf)
 }
@@ -218,9 +298,10 @@ type headerAndStatus struct {
 }
 
 type getterContext struct {
-	rw   http.ResponseWriter
-	req  *http.Request
-	next caddyhttp.Handler
+	rw     http.ResponseWriter
+	req    *http.Request
+	next   caddyhttp.Handler
+	reqDir *cacheobject.RequestCacheDirectives
 }
 
 var bufPool = sync.Pool{

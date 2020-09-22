@@ -11,5 +11,6 @@ require (
 	github.com/hashicorp/go-sockaddr v1.0.2 // indirect
 	github.com/hashicorp/golang-lru v0.5.4 // indirect
 	github.com/hashicorp/memberlist v0.2.0 // indirect
+	github.com/pquerna/cachecontrol v0.0.0-20200921180117-858c6e7e6b7e
 	go.uber.org/zap v1.14.1
 )

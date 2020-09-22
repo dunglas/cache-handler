@@ -9,12 +9,18 @@
 					"listen": [":80"],
 					"routes": [
 						{
+							"match": [{
+								"path": ["/cache-header"]
+							}],
 							"handle": [
 								{
 									"handler": "cache"
 								},
 								{
 									"handler": "static_response",
+									"headers": {
+										"Cache-Control": ["s-maxage=60"]
+									},
 									"body": "Hello there!"
 								}
 							]
