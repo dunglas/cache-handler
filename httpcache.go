@@ -38,6 +38,12 @@ func init() {
 	caddy.RegisterModule(Cache{})
 }
 
+type Olric struct {
+	Env           string `json:"env,omitempty"`
+	BindPort      int    `json:"bind_port,omitempty"`
+	DiscoveryPort int    `json:"discovery_port,omitempty"`
+}
+
 // Cache implements a simple distributed cache.
 //
 // Caches only GET and HEAD requests. Honors the Cache-Control: no-cache header.
@@ -52,7 +58,8 @@ func init() {
 type Cache struct {
 	// Maximum size of the cache, in bytes. Default is 512 MB.
 	MaxSize    int64 `json:"max_size,omitempty"`
-	DefaultTTL int64 `json:"default_ttl,omitempty"`
+	DefaultTTL int   `json:"default_ttl,omitempty"`
+	Olric      Olric `json:"olric,omitempty"`
 
 	db     *olric.Olric
 	dmap   *olric.DMap
@@ -77,9 +84,19 @@ func (c *Cache) Provision(ctx caddy.Context) error {
 		maxSize = int64(maxMB << 20)
 	}
 
-	// TODO: Set environment
+	if c.Olric.Env == "" {
+		c.Olric.Env = "local"
+	}
+
 	started, cancel := context.WithCancel(context.Background())
-	cfg := config.New("local")
+	cfg := config.New(c.Olric.Env)
+	if c.Olric.BindPort != 0 {
+		cfg.BindPort = c.Olric.BindPort
+	}
+	if c.Olric.DiscoveryPort != 0 {
+		cfg.MemberlistConfig.BindPort = c.Olric.DiscoveryPort
+		cfg.MemberlistConfig.AdvertisePort = c.Olric.DiscoveryPort
+	}
 	cfg.Cache.MaxInuse = int(maxSize)
 	cfg.Started = func() {
 		defer cancel()
@@ -107,6 +124,15 @@ func (c *Cache) Provision(ctx caddy.Context) error {
 	}
 	c.dmap, err = c.db.NewDMap(dmapName)
 	return err
+}
+
+// Cleanup shutdowns Olric's DB.
+func (c *Cache) Cleanup() error {
+	if c.db == nil {
+		return nil
+	}
+
+	return c.db.Shutdown(context.Background())
 }
 
 // Validate validates c.
@@ -321,6 +347,7 @@ const getterContextCtxKey ctxKey = "getter_context"
 // Interface guards
 var (
 	_ caddy.Provisioner           = (*Cache)(nil)
+	_ caddy.CleanerUpper          = (*Cache)(nil)
 	_ caddy.Validator             = (*Cache)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Cache)(nil)
 )
