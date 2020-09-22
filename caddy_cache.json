@@ -6,7 +6,7 @@
 		"http": {
 			"servers": {
 				"dev": {
-					"listen": [":8080"],
+					"listen": [":80"],
 					"routes": [
 						{
 							"handle": [

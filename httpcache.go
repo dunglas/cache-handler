@@ -20,7 +20,6 @@ import (
 	"encoding/gob"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"sync"
 
@@ -28,6 +27,7 @@ import (
 	"github.com/buraksezer/olric/config"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"go.uber.org/zap"
 )
 
 func init() {
@@ -49,8 +49,9 @@ type Cache struct {
 	// Maximum size of the cache, in bytes. Default is 512 MB.
 	MaxSize int64 `json:"max_size,omitempty"`
 
-	db   *olric.Olric
-	dmap *olric.DMap
+	db     *olric.Olric
+	dmap   *olric.DMap
+	logger *zap.Logger
 }
 
 // CaddyModule returns the Caddy module information.
@@ -63,6 +64,8 @@ func (Cache) CaddyModule() caddy.ModuleInfo {
 
 // Provision provisions c.
 func (c *Cache) Provision(ctx caddy.Context) error {
+	c.logger = ctx.Logger(c)
+
 	maxSize := c.MaxSize
 	if maxSize == 0 {
 		const maxMB = 512
@@ -75,18 +78,20 @@ func (c *Cache) Provision(ctx caddy.Context) error {
 	cfg.Cache.MaxInuse = int(maxSize)
 	cfg.Started = func() {
 		defer cancel()
-		log.Printf("[INFO] Olric is ready to accept connections")
+
+		c.logger.Info("olric is ready to accept connections")
 	}
-	db, err := olric.New(cfg)
+	var err error
+	c.db, err = olric.New(cfg)
 	if err != nil {
 		return err
 	}
 
 	errCh := make(chan error, 1)
 	go func() {
-		err = db.Start()
+		err = c.db.Start()
 		if err != nil {
-			log.Printf("[ERROR] olric.Start returned an error: %v", err)
+			c.logger.Error("olric.Start returned an error", zap.Error(err))
 			errCh <- err
 		}
 	}()
@@ -95,7 +100,7 @@ func (c *Cache) Provision(ctx caddy.Context) error {
 		return err
 	case <-started.Done():
 	}
-	c.dmap, err = db.NewDMap(dmapName)
+	c.dmap, err = c.db.NewDMap(dmapName)
 	return err
 }
 
@@ -174,7 +179,7 @@ func (c *Cache) serveAndCache(ctx context.Context, key string, buf *bytes.Buffer
 				Status: status,
 			})
 			if err != nil {
-				log.Printf("[ERROR] Encoding headers for cache entry: %v; not caching this request", err)
+				c.logger.Error("encoding headers for cache entry, not caching this request", zap.Error(err))
 				return false
 			}
 		}

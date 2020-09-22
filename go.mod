@@ -1,4 +1,4 @@
-module github.com/buraksezer/cache-handler
+module github.com/caddyserver/cache-handler
 
 go 1.14
 
@@ -11,4 +11,5 @@ require (
 	github.com/hashicorp/go-sockaddr v1.0.2 // indirect
 	github.com/hashicorp/golang-lru v0.5.4 // indirect
 	github.com/hashicorp/memberlist v0.2.0 // indirect
+	go.uber.org/zap v1.14.1
 )
